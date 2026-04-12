@@ -8,9 +8,8 @@ Claude Code CLI can use Kimi K2.5 as a drop-in replacement for Claude.
 import json
 import os
 import re
-import time
 import uuid
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from functools import reduce
@@ -40,7 +39,7 @@ class Config:
             openai_base_url=os.getenv("OPENAI_BASE_URL", "https://inference.baseten.co/v1").rstrip("/"),
             target_model=os.getenv("TARGET_MODEL", "moonshotai/Kimi-K2.5"),
             proxy_auth_key=os.getenv("PROXY_AUTH_KEY"),
-            log_path="/Users/shauryagunderia/PersonalProjects/AiExplore/.cursor/debug-7c7eab.log",
+            log_path=os.getenv("LOG_PATH", ""),
         )
 
 CONFIG = Config.from_env()
@@ -61,22 +60,6 @@ def extract_text(content: Any) -> str:
             )
         case _:
             return str(content)
-
-
-def parse_content_block(block: dict) -> dict | None:
-    """Parse a content block into the internal representation."""
-    match block.get("type"):
-        case "text":
-            return {"type": "text", "text": block.get("text", "")}
-        case "tool_use":
-            return {
-                "type": "tool_use",
-                "id": block.get("id", f"toolu_{uuid.uuid4().hex[:24]}"),
-                "name": block["name"],
-                "input": block.get("input", {}),
-            }
-        case _:
-            return None
 
 
 def convert_assistant_content(content: Any) -> tuple[str | None, list[dict]]:
@@ -151,11 +134,6 @@ def compose(*functions: Callable[[Any], Any]) -> Callable[[Any], Any]:
     def composed(x: Any) -> Any:
         return reduce(lambda v, f: f(v), reversed(functions), x)
     return composed
-
-
-def filter_empty_messages(messages: list[dict]) -> list[dict]:
-    """Remove messages that have no content."""
-    return [m for m in messages if m.get("content") or m.get("role") == "tool"]
 
 
 def convert_single_message(msg: dict) -> list[dict]:
@@ -559,7 +537,7 @@ async def stream_sse(
     headers: dict[str, str],
     payload: dict[str, Any],
     http_client: httpx.AsyncClient,
-) -> Iterator[str]:
+):
     """
     Generator pipeline: consume OpenAI stream, yield Anthropic SSE events.
     Uses immutable state transitions instead of mutable buffers.

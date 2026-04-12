@@ -1,0 +1,91 @@
+# Model Registry for Anthropic Proxy
+# Maps model aliases to their capabilities and provider configurations
+
+models:
+  # Anthropic models (native)
+  claude-opus-4:
+    provider: anthropic
+    model_id: claude-opus-4-20250514
+    capabilities:
+      - tools
+      - vision
+      - streaming
+      - extended_thinking
+    max_tokens: 8192
+    context_window: 200000
+
+  claude-sonnet-4:
+    provider: anthropic
+    model_id: claude-sonnet-4-20250514
+    capabilities:
+      - tools
+      - vision
+      - streaming
+    max_tokens: 8192
+    context_window: 200000
+
+  claude-haiku-4:
+    provider: anthropic
+    model_id: claude-haiku-4-20250514
+    capabilities:
+      - tools
+      - vision
+      - streaming
+    max_tokens: 4096
+    context_window: 200000
+
+  # Kimi models (via Baseten)
+  kimi-k2.5:
+    provider: baseten
+    model_id: moonshotai/Kimi-K2.5
+    capabilities:
+      - tools
+      - streaming
+    tool_format: embedded
+    max_tokens: 8192
+    context_window: 256000
+
+  # OpenAI models
+  gpt-4o:
+    provider: openai
+    model_id: gpt-4o-2024-08-06
+    capabilities:
+      - tools
+      - vision
+      - streaming
+      - json_mode
+    max_tokens: 4096
+    context_window: 128000
+
+  gpt-4o-mini:
+    provider: openai
+    model_id: gpt-4o-mini-2024-07-18
+    capabilities:
+      - tools
+      - vision
+      - streaming
+      - json_mode
+    max_tokens: 4096
+    context_window: 128000
+
+# Provider configurations
+providers:
+  anthropic:
+    base_url: https://api.anthropic.com/v1
+    auth_header: x-api-key
+    supports_streaming: true
+    supports_tools: true
+
+  baseten:
+    base_url: https://inference.baseten.co/v1
+    auth_header: Authorization
+    auth_prefix: Bearer
+    supports_streaming: true
+    supports_tools: true
+
+  openai:
+    base_url: https://api.openai.com/v1
+    auth_header: Authorization
+    auth_prefix: Bearer
+    supports_streaming: true
+    supports_tools: true

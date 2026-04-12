@@ -1,0 +1,80 @@
+version: "3.8"
+
+services:
+  proxy:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "${PROXY_PORT:-8000}:8000"
+    environment:
+      - BASETEN_API_KEY=${BASETEN_API_KEY}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - PROXY_AUTH_KEY=${PROXY_AUTH_KEY}
+      - DEFAULT_MODEL=${DEFAULT_MODEL:-kimi-k2.5}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - LOG_FORMAT=${LOG_FORMAT:-json}
+    volumes:
+      - ./models.yaml:/app/models.yaml:ro
+      - ./logs:/app/logs
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 5s
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 2G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+
+  # Optional: Redis for distributed caching
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+    profiles:
+      - with-redis
+
+  # Optional: Prometheus for metrics
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+    restart: unless-stopped
+    profiles:
+      - with-metrics
+
+  # Optional: Grafana for dashboards
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./grafana/datasources:/etc/grafana/provisioning/datasources:ro
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-admin}
+    restart: unless-stopped
+    profiles:
+      - with-metrics
+
+volumes:
+  redis_data:
+  prometheus_data:
+  grafana_data:
