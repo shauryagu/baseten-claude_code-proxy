@@ -42,8 +42,19 @@ models:
       - tools
       - streaming
     tool_format: embedded
-    max_tokens: 8192
+    max_tokens: 16384
     context_window: 256000
+
+  # GLM models (via Baseten)
+  glm-4.7:
+    provider: baseten
+    model_id: zai-org/GLM-4.7
+    capabilities:
+      - tools
+      - streaming
+    tool_format: native
+    max_tokens: 16384
+    context_window: 128000
 
   # OpenAI models
   gpt-4o:

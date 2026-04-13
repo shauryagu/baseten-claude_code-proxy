@@ -6,9 +6,11 @@ alternative backends like Kimi K2.5 via Baseten or other providers.
 """
 
 import json
+import re
 import uuid
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from typing import Any, Optional, Union
 
 import httpx
@@ -46,11 +48,12 @@ def setup_error_handlers(app: FastAPI) -> None:
     @app.exception_handler(ProxyError)
     async def handle_proxy_error(request: Request, exc: ProxyError) -> JSONResponse:
         """Handle custom proxy errors."""
+        # Use `error_message` to avoid shadowing the positional `message` param of logger.error()
         logger.error(
             "proxy_error",
             error_type=exc.error_type,
             status_code=exc.status_code,
-            message=exc.message,
+            error_message=exc.message,
         )
         return JSONResponse(
             content=exc.to_dict(),
@@ -103,16 +106,262 @@ def get_model_for_request(requested_model: str) -> tuple[str, Any]:
         model_id = capability.model_id
         handler = ModelHandlerRegistry.get_handler_instance(requested_model, capability)
     else:
-        # Use default model from config
-        model_id = CONFIG.default_model
-        handler = ModelHandlerRegistry.get_handler_instance(model_id)
+        # Requested model not in registry — resolve the default model through the
+        # registry so we get the real upstream model_id (e.g. "moonshotai/Kimi-K2.5")
+        # rather than sending the alias (e.g. "kimi-k2.5") which the upstream won't recognise.
+        default_capability = registry.get_model(CONFIG.default_model)
+        if default_capability:
+            model_id = default_capability.model_id
+            handler = ModelHandlerRegistry.get_handler_instance(
+                CONFIG.default_model, default_capability
+            )
+        else:
+            model_id = CONFIG.default_model
+            handler = ModelHandlerRegistry.get_handler_instance(model_id)
 
     return model_id, handler
 
 
 # ---------------------------------------------------------------------------
-# Streaming Response
+# Streaming: helpers and state machine (ported from app_optimized.py)
 # ---------------------------------------------------------------------------
+
+
+def create_sse_event(event: str, data: dict[str, Any]) -> str:
+    """Format a single SSE event string."""
+    return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+
+
+def map_finish_reason(finish: Optional[str]) -> str:
+    """Map OpenAI finish_reason to Anthropic stop_reason."""
+    mapping = {"stop": "end_turn", "length": "max_tokens", "tool_calls": "tool_use"}
+    return mapping.get(finish or "", finish or "end_turn")
+
+
+_KIMI_CALL_RE = re.compile(
+    r'<\|tool_call_begin\|>(?:functions\.)?(\w+)(?::\d+)?'
+    r'<\|tool_call_argument_begin\|>(.*?)<\|tool_call_end\|>',
+    re.DOTALL,
+)
+
+
+def parse_kimi_tool_calls(text: str) -> tuple[str, list[dict[str, Any]]]:
+    """Extract tool calls from Kimi's text-embedded syntax."""
+    clean_parts = text.split("<|tool_calls_section_begin|>")
+    before = clean_parts[0] if clean_parts else ""
+    after_parts = text.split("<|tool_calls_section_end|>")
+    after = after_parts[-1] if len(after_parts) > 1 else ""
+    clean = (before + after).strip()
+
+    tool_uses = [
+        {
+            "type": "tool_use",
+            "id": f"toolu_{uuid.uuid4().hex[:24]}",
+            "name": m.group(1),
+            "input": json.loads(m.group(2).strip()) if m.group(2).strip() else {"raw": m.group(2).strip()},
+        }
+        for m in _KIMI_CALL_RE.finditer(text)
+    ]
+
+    return clean, tool_uses
+
+
+@dataclass(frozen=True)
+class StreamState:
+    """Immutable streaming state container."""
+    content_index: int
+    text_block_open: bool
+    accumulated_text: tuple[str, ...]
+    structured_tcs: tuple[tuple[int, dict[str, str]], ...]
+    kimi_buf: tuple[str, ...]
+    in_kimi_section: bool
+    output_tokens: int
+    finish_reason: Optional[str]
+
+
+@dataclass(frozen=True)
+class DeltaUpdate:
+    """Immutable delta update from OpenAI stream."""
+    content: Optional[str]
+    tool_calls: Optional[list[dict]]
+    finish_reason: Optional[str]
+
+
+def parse_delta(obj: dict[str, Any]) -> Optional[DeltaUpdate]:
+    """Extract delta from an OpenAI stream chunk."""
+    choices = obj.get("choices")
+    if not choices:
+        return None
+    delta = choices[0].get("delta", {})
+    return DeltaUpdate(
+        content=delta.get("content"),
+        tool_calls=delta.get("tool_calls") if delta.get("tool_calls") else None,
+        finish_reason=choices[0].get("finish_reason"),
+    )
+
+
+def transition_state(state: StreamState, delta: DeltaUpdate) -> tuple[StreamState, list[str]]:
+    """Compute next state and SSE events from a delta. Pure function."""
+    events: list[str] = []
+    new_state = state
+
+    # --- native structured tool_calls ---
+    if delta.tool_calls:
+        if state.text_block_open:
+            events.append(create_sse_event("content_block_stop", {"type": "content_block_stop", "index": state.content_index}))
+            new_state = StreamState(
+                content_index=state.content_index + 1,
+                text_block_open=False,
+                accumulated_text=state.accumulated_text,
+                structured_tcs=state.structured_tcs,
+                kimi_buf=state.kimi_buf,
+                in_kimi_section=state.in_kimi_section,
+                output_tokens=state.output_tokens,
+                finish_reason=state.finish_reason,
+            )
+
+        for tc in delta.tool_calls:
+            idx = tc.get("index", 0)
+            existing = dict(new_state.structured_tcs)
+            if idx not in existing:
+                existing[idx] = {
+                    "id": tc.get("id", f"toolu_{uuid.uuid4().hex[:24]}"),
+                    "name": tc.get("function", {}).get("name", ""),
+                    "arguments": "",
+                }
+            fn = tc.get("function", {})
+            if fn.get("name"):
+                existing[idx]["name"] = fn["name"]
+            if fn.get("arguments"):
+                existing[idx]["arguments"] += fn["arguments"]
+
+            new_state = StreamState(
+                content_index=new_state.content_index,
+                text_block_open=new_state.text_block_open,
+                accumulated_text=new_state.accumulated_text,
+                structured_tcs=tuple(existing.items()),
+                kimi_buf=new_state.kimi_buf,
+                in_kimi_section=new_state.in_kimi_section,
+                output_tokens=new_state.output_tokens + 1,
+                finish_reason=new_state.finish_reason,
+            )
+
+        return new_state, events
+
+    # --- text content ---
+    chunk = delta.content
+    if not chunk:
+        if delta.finish_reason:
+            return StreamState(
+                content_index=new_state.content_index,
+                text_block_open=new_state.text_block_open,
+                accumulated_text=new_state.accumulated_text,
+                structured_tcs=new_state.structured_tcs,
+                kimi_buf=new_state.kimi_buf,
+                in_kimi_section=new_state.in_kimi_section,
+                output_tokens=new_state.output_tokens,
+                finish_reason=delta.finish_reason,
+            ), events
+        return new_state, events
+
+    # --- detect Kimi embedded tool section ---
+    if "<|tool_calls_section_begin|>" in chunk:
+        before = chunk.split("<|tool_calls_section_begin|>")[0]
+        if before.strip() and not new_state.text_block_open:
+            events.append(create_sse_event("content_block_start", {
+                "type": "content_block_start",
+                "index": new_state.content_index,
+                "content_block": {"type": "text", "text": ""},
+            }))
+            new_state = StreamState(
+                content_index=new_state.content_index,
+                text_block_open=True,
+                accumulated_text=new_state.accumulated_text,
+                structured_tcs=new_state.structured_tcs,
+                kimi_buf=new_state.kimi_buf,
+                in_kimi_section=new_state.in_kimi_section,
+                output_tokens=new_state.output_tokens,
+                finish_reason=new_state.finish_reason,
+            )
+
+        if before.strip():
+            events.append(create_sse_event("content_block_delta", {
+                "type": "content_block_delta",
+                "index": new_state.content_index,
+                "delta": {"type": "text_delta", "text": before},
+            }))
+            new_state = StreamState(
+                content_index=new_state.content_index,
+                text_block_open=new_state.text_block_open,
+                accumulated_text=new_state.accumulated_text + (before,),
+                structured_tcs=new_state.structured_tcs,
+                kimi_buf=new_state.kimi_buf + (chunk,),
+                in_kimi_section=True,
+                output_tokens=new_state.output_tokens + 1,
+                finish_reason=new_state.finish_reason,
+            )
+        else:
+            new_state = StreamState(
+                content_index=new_state.content_index,
+                text_block_open=new_state.text_block_open,
+                accumulated_text=new_state.accumulated_text,
+                structured_tcs=new_state.structured_tcs,
+                kimi_buf=new_state.kimi_buf + (chunk,),
+                in_kimi_section=True,
+                output_tokens=new_state.output_tokens + 1,
+                finish_reason=new_state.finish_reason,
+            )
+        return new_state, events
+
+    # --- inside Kimi section: buffer silently ---
+    if new_state.in_kimi_section:
+        new_kimi_buf = new_state.kimi_buf + (chunk,)
+        new_in_kimi = "<|tool_calls_section_end|>" not in chunk
+        return StreamState(
+            content_index=new_state.content_index,
+            text_block_open=new_state.text_block_open,
+            accumulated_text=new_state.accumulated_text,
+            structured_tcs=new_state.structured_tcs,
+            kimi_buf=new_kimi_buf,
+            in_kimi_section=new_in_kimi,
+            output_tokens=new_state.output_tokens + 1,
+            finish_reason=new_state.finish_reason,
+        ), events
+
+    # --- normal text: emit immediately ---
+    if not new_state.text_block_open:
+        events.append(create_sse_event("content_block_start", {
+            "type": "content_block_start",
+            "index": new_state.content_index,
+            "content_block": {"type": "text", "text": ""},
+        }))
+        new_state = StreamState(
+            content_index=new_state.content_index,
+            text_block_open=True,
+            accumulated_text=new_state.accumulated_text,
+            structured_tcs=new_state.structured_tcs,
+            kimi_buf=new_state.kimi_buf,
+            in_kimi_section=new_state.in_kimi_section,
+            output_tokens=new_state.output_tokens,
+            finish_reason=new_state.finish_reason,
+        )
+
+    events.append(create_sse_event("content_block_delta", {
+        "type": "content_block_delta",
+        "index": new_state.content_index,
+        "delta": {"type": "text_delta", "text": chunk},
+    }))
+
+    return StreamState(
+        content_index=new_state.content_index,
+        text_block_open=new_state.text_block_open,
+        accumulated_text=new_state.accumulated_text + (chunk,),
+        structured_tcs=new_state.structured_tcs,
+        kimi_buf=new_state.kimi_buf,
+        in_kimi_section=new_state.in_kimi_section,
+        output_tokens=new_state.output_tokens + 1,
+        finish_reason=new_state.finish_reason,
+    ), events
 
 
 async def stream_anthropic_response(
@@ -122,25 +371,32 @@ async def stream_anthropic_response(
 ) -> AsyncGenerator[str, None]:
     """
     Stream Anthropic-formatted SSE events from upstream OpenAI response.
-
-    Args:
-        upstream_response: The httpx streaming response
-        request_id: Unique request ID
-        model: Model ID
-
-    Yields:
-        SSE formatted strings
+    Uses immutable state transitions ported from app_optimized.py.
     """
-    msg_id = f"msg_{uuid.uuid4().hex[:24]}"
+    msg_id = f"msg_{uuid.uuid4().hex}"
 
-    # Send message_start
-    yield f"event: message_start\ndata: {json.dumps({'type': 'message_start', 'message': {'id': msg_id, 'type': 'message', 'role': 'assistant', 'model': model, 'content': [], 'stop_reason': None}})}\n\n"
+    yield create_sse_event("message_start", {
+        "type": "message_start",
+        "message": {
+            "id": msg_id,
+            "type": "message",
+            "role": "assistant",
+            "model": model,
+            "content": [],
+            "stop_reason": None,
+        },
+    })
 
-    content_index = 0
-    text_block_open = False
-    tool_calls_buffer: dict[int, dict] = {}
-    output_tokens = 0
-    finish_reason = None
+    state = StreamState(
+        content_index=0,
+        text_block_open=False,
+        accumulated_text=(),
+        structured_tcs=(),
+        kimi_buf=(),
+        in_kimi_section=False,
+        output_tokens=0,
+        finish_reason=None,
+    )
 
     async for line in upstream_response.aiter_lines():
         if not line or not line.startswith("data:"):
@@ -152,76 +408,58 @@ async def stream_anthropic_response(
 
         try:
             obj = json.loads(raw)
-            choices = obj.get("choices", [])
-            if not choices:
+            delta = parse_delta(obj)
+            if delta is None:
                 continue
 
-            delta = choices[0].get("delta", {})
-            content = delta.get("content")
-            tool_calls = delta.get("tool_calls")
-            finish_reason = choices[0].get("finish_reason") or finish_reason
+            state, events = transition_state(state, delta)
+            for event in events:
+                yield event
 
-            # Handle tool calls
-            if tool_calls:
-                if text_block_open:
-                    yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': content_index})}\n\n"
-                    text_block_open = False
-                    content_index += 1
-
-                for tc in tool_calls:
-                    idx = tc.get("index", 0)
-                    if idx not in tool_calls_buffer:
-                        tool_calls_buffer[idx] = {
-                            "id": tc.get("id", f"toolu_{uuid.uuid4().hex[:24]}"),
-                            "name": tc.get("function", {}).get("name", ""),
-                            "arguments": "",
-                        }
-                    fn = tc.get("function", {})
-                    if fn.get("name"):
-                        tool_calls_buffer[idx]["name"] = fn["name"]
-                    if fn.get("arguments"):
-                        tool_calls_buffer[idx]["arguments"] += fn["arguments"]
-
-                output_tokens += 1
-                continue
-
-            # Handle text content
-            if content:
-                if not text_block_open:
-                    yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': content_index, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
-                    text_block_open = True
-
-                yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': content_index, 'delta': {'type': 'text_delta', 'text': content}})}\n\n"
-                output_tokens += 1
-
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, KeyError):
             continue
 
-    # Close text block if open
-    if text_block_open:
-        yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': content_index})}\n\n"
-        content_index += 1
+    # Finalize: close text block, emit tool_use blocks, send stop events
+    if state.text_block_open:
+        yield create_sse_event("content_block_stop", {"type": "content_block_stop", "index": state.content_index})
 
-    # Emit tool calls
-    if tool_calls_buffer:
-        for idx, tc in sorted(tool_calls_buffer.items()):
+    # Build tool blocks from structured deltas or Kimi embedded-text fallback
+    tool_blocks: list[dict[str, Any]] = []
+    if state.structured_tcs:
+        for idx, tc in sorted(state.structured_tcs, key=lambda x: x[0]):
             try:
-                args = json.loads(tc["arguments"]) if tc["arguments"] else {}
+                inp = json.loads(tc["arguments"]) if tc["arguments"] else {}
             except json.JSONDecodeError:
-                args = {"raw": tc["arguments"]}
+                inp = {"raw": tc["arguments"]}
+            tool_blocks.append({"id": tc["id"], "name": tc["name"], "input": inp})
+    elif state.kimi_buf:
+        _, parsed = parse_kimi_tool_calls("".join(state.kimi_buf))
+        for p in parsed:
+            tool_blocks.append({"id": p["id"], "name": p["name"], "input": p["input"]})
 
-            yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': content_index, 'content_block': {'type': 'tool_use', 'id': tc['id'], 'name': tc['name'], 'input': {}}})}\n\n"
-            yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': content_index, 'delta': {'type': 'input_json_delta', 'partial_json': json.dumps(args)}})}\n\n"
-            yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': content_index})}\n\n"
-            content_index += 1
+    content_idx = state.content_index + (1 if state.text_block_open else 0)
+    for tb in tool_blocks:
+        yield create_sse_event("content_block_start", {
+            "type": "content_block_start",
+            "index": content_idx,
+            "content_block": {"type": "tool_use", "id": tb["id"], "name": tb["name"], "input": {}},
+        })
+        yield create_sse_event("content_block_delta", {
+            "type": "content_block_delta",
+            "index": content_idx,
+            "delta": {"type": "input_json_delta", "partial_json": json.dumps(tb["input"])},
+        })
+        yield create_sse_event("content_block_stop", {"type": "content_block_stop", "index": content_idx})
+        content_idx += 1
 
-        stop_reason = "tool_use"
-    else:
-        stop_reason = finish_reason or "end_turn"
+    stop = "tool_use" if tool_blocks else map_finish_reason(state.finish_reason)
 
-    # Send message_delta and message_stop
-    yield f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': stop_reason}, 'usage': {'output_tokens': output_tokens}})}\n\n"
-    yield f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
+    yield create_sse_event("message_delta", {
+        "type": "message_delta",
+        "delta": {"stop_reason": stop},
+        "usage": {"output_tokens": state.output_tokens},
+    })
+    yield create_sse_event("message_stop", {"type": "message_stop"})
 
 
 # ---------------------------------------------------------------------------
@@ -293,15 +531,7 @@ def build_anthropic_message(
     has_tool = any(b["type"] == "tool_use" for b in blocks)
     finish_reason = choice.get("finish_reason")
 
-    # Map finish reason
-    if has_tool:
-        stop_reason = "tool_use"
-    elif finish_reason == "stop":
-        stop_reason = "end_turn"
-    elif finish_reason == "length":
-        stop_reason = "max_tokens"
-    else:
-        stop_reason = finish_reason or "end_turn"
+    stop_reason = "tool_use" if has_tool else map_finish_reason(finish_reason)
 
     return {
         "id": f"msg_{uuid.uuid4().hex[:24]}",
@@ -476,15 +706,35 @@ async def messages(
         if tools:
             payload["tools"] = tools
 
+        # Convert Anthropic tool_choice format to OpenAI format.
+        # Anthropic: {"type": "auto"} / {"type": "any"} / {"type": "tool", "name": "X"}
+        # OpenAI:    "auto" / "required" / {"type": "function", "function": {"name": "X"}}
+        if validated_request.tool_choice is not None:
+            tc = validated_request.tool_choice
+            tc_type = tc.get("type") if isinstance(tc, dict) else tc
+            if tc_type in ("auto", "none"):
+                payload["tool_choice"] = tc_type
+            elif tc_type == "any":
+                payload["tool_choice"] = "required"
+            elif tc_type == "tool" and isinstance(tc, dict):
+                payload["tool_choice"] = {
+                    "type": "function",
+                    "function": {"name": tc.get("name", "")},
+                }
+            else:
+                payload["tool_choice"] = tc
+
         if validated_request.stream:
-            payload["stream_options"] = {"include_usage": True}
+            payload["stream_options"] = {"include_usage": True, "continuous_usage_stats": True}
 
         # Get circuit breaker
         circuit_breaker = get_circuit_breaker()
 
         # Make upstream request
         url = f"{CONFIG.baseten_base_url}/chat/completions"
-        headers = {
+        # Use a separate variable to avoid shadowing the route's `headers` parameter
+        # and to prevent upstream auth credentials from leaking into the client response.
+        upstream_headers = {
             "Authorization": f"Bearer {CONFIG.baseten_api_key}",
             "Content-Type": "application/json",
         }
@@ -492,9 +742,9 @@ async def messages(
         async def make_request():
             client = ConnectionPool.get_client()
             if validated_request.stream:
-                return client.stream("POST", url, headers=headers, json=payload)
+                return client.stream("POST", url, headers=upstream_headers, json=payload)
             else:
-                return await client.post(url, headers=headers, json=payload)
+                return await client.post(url, headers=upstream_headers, json=payload)
 
         try:
             response = await circuit_breaker.call(make_request)
@@ -532,21 +782,64 @@ async def messages(
             ) from e
 
         if validated_request.stream:
-            # Return streaming response
+            # Return streaming response.
+            # raise_for_status() is called inside the context manager so that
+            # upstream 4xx/5xx during streaming are translated to UpstreamError
+            # before any response bytes are sent to the client.
             async def stream_generator():
                 async with response as resp:
-                    resp.raise_for_status()
+                    try:
+                        resp.raise_for_status()
+                    except httpx.HTTPStatusError as e:
+                        upstream_status = e.response.status_code
+                        if upstream_status == 429:
+                            retry_after_raw = e.response.headers.get("Retry-After", "60")
+                            try:
+                                retry_after = int(retry_after_raw)
+                            except ValueError:
+                                retry_after = 60
+                            raise RateLimitError(
+                                "Upstream rate limit exceeded",
+                                retry_after=retry_after,
+                                details={"source": "upstream", "provider": "baseten"},
+                            ) from e
+                        raise UpstreamError(
+                            f"Upstream returned HTTP {upstream_status}",
+                            upstream_status=upstream_status,
+                            provider="baseten",
+                        ) from e
                     async for event in stream_anthropic_response(resp, request_id, model_id):
                         yield event
 
             return StreamingResponse(
                 stream_generator(),
                 media_type="text/event-stream",
-                headers=headers,
             )
         else:
-            # Return non-streaming response
-            response.raise_for_status()
+            # Return non-streaming response.
+            # raise_for_status() must be inside its own try/except so upstream
+            # 4xx errors are surfaced as UpstreamError rather than a generic 500.
+            try:
+                response.raise_for_status()
+            except httpx.HTTPStatusError as e:
+                upstream_status = e.response.status_code
+                if upstream_status == 429:
+                    retry_after_raw = e.response.headers.get("Retry-After", "60")
+                    try:
+                        retry_after = int(retry_after_raw)
+                    except ValueError:
+                        retry_after = 60
+                    raise RateLimitError(
+                        "Upstream rate limit exceeded",
+                        retry_after=retry_after,
+                        details={"source": "upstream", "provider": "baseten"},
+                    ) from e
+                raise UpstreamError(
+                    f"Upstream returned HTTP {upstream_status}",
+                    upstream_status=upstream_status,
+                    provider="baseten",
+                ) from e
+
             upstream_data = response.json()
 
             # Parse with handler
@@ -555,10 +848,7 @@ async def messages(
             # Build Anthropic response
             anthropic_response = build_anthropic_message(parsed, model_id)
 
-            return JSONResponse(
-                content=anthropic_response,
-                headers=headers,
-            )
+            return JSONResponse(content=anthropic_response)
 
     except ProxyError:
         raise

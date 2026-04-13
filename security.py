@@ -17,7 +17,7 @@ class ToolDefinition(BaseModel):
     """Validated tool definition."""
 
     name: str = Field(..., min_length=1, max_length=64)
-    description: str = Field(default="", max_length=1024)
+    description: str = Field(default="", max_length=100000)
     input_schema: dict[str, Any] = Field(default_factory=lambda: {"type": "object", "properties": {}})
 
     @field_validator("name")
@@ -81,10 +81,9 @@ class MessageRequest(BaseModel):
                 raise ValueError(f"Message {i} must be an object")
             if "role" not in msg:
                 raise ValueError(f"Message {i} missing 'role' field")
-            if "content" not in msg:
+            # content is optional on assistant messages (may only have tool_calls)
+            if "content" not in msg and msg.get("role") != "assistant":
                 raise ValueError(f"Message {i} missing 'content' field")
-            if msg["role"] not in {"user", "assistant", "system"}:
-                raise ValueError(f"Message {i} has invalid role: {msg['role']}")
 
         return v
 
@@ -113,7 +112,7 @@ class SecurityConfig(BaseModel):
     max_request_size: int = 50 * 1024 * 1024  # 50MB
     max_message_size: int = 10 * 1024 * 1024  # 10MB per message
     max_tools: int = 256
-    max_tool_description_length: int = 1024
+    max_tool_description_length: int = 100000
     max_content_length: int = 100000  # characters
     allowed_content_types: set[str] = {"text", "image", "tool_use", "tool_result"}
     blocked_patterns: list[str] = Field(default_factory=list)

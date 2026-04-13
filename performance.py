@@ -30,13 +30,15 @@ class ConnectionPool:
     def get_client(cls) -> httpx.AsyncClient:
         """Get or create the shared HTTP client."""
         if cls._instance is None:
+            # No timeout — tool calls and long streaming responses must not be cut off.
+            # This matches the behaviour of the proven app_optimized.py client.
             cls._instance = httpx.AsyncClient(
-                timeout=httpx.Timeout(CONFIG.request_timeout),
+                timeout=httpx.Timeout(None),
                 limits=httpx.Limits(
                     max_keepalive_connections=CONFIG.keepalive_connections,
                     max_connections=CONFIG.max_connections,
                 ),
-                http2=True,  # Enable HTTP/2 for multiplexing
+                http2=True,
             )
             logger.info(
                 "http_client_initialized",

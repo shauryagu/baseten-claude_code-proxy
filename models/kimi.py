@@ -10,14 +10,14 @@ Handles Kimi's quirks:
 import json
 import re
 import uuid
-from typing import Any, Optional, Union
+from typing import Any, Optional
 
 from config import ModelCapability
-from models import ModelHandler
+from models import DefaultHandler
 
 
-class KimiHandler(ModelHandler):
-    """Kimi K2.5 specific handling."""
+class KimiHandler(DefaultHandler):
+    """Kimi K2.5 specific handling — inherits Anthropic→OpenAI conversion from DefaultHandler."""
 
     # Pattern for Kimi tool calls in embedded format
     _KIMI_CALL_RE = re.compile(
@@ -33,72 +33,10 @@ class KimiHandler(ModelHandler):
         """
         Transform messages for Kimi.
 
-        Kimi handles messages similarly to OpenAI, but we need to ensure
-        tool results are properly formatted.
+        Kimi K2.5 via Baseten uses a standard OpenAI-compatible endpoint,
+        so standard role:"tool" messages work correctly. No rewriting needed.
         """
-        formatted = []
-        for msg in messages:
-            role = msg.get("role")
-            content = msg.get("content")
-
-            if role == "tool":
-                # Kimi expects tool results as user messages with special format
-                formatted.append({
-                    "role": "user",
-                    "content": f"Tool result for {msg.get('tool_call_id', 'unknown')}: {content}",
-                })
-            elif role == "assistant" and msg.get("tool_calls"):
-                # Include tool calls in assistant message
-                formatted.append(msg)
-            else:
-                formatted.append(msg)
-
-        return formatted
-
-    def prepare_tools(
-        self, tools: Optional[list[dict[str, Any]]]
-    ) -> Optional[list[dict[str, Any]]]:
-        """
-        Transform tool definitions for Kimi.
-
-        Kimi uses standard OpenAI format for tool definitions.
-        """
-        if not tools:
-            return None
-
-        formatted = []
-        for tool in tools:
-            formatted.append({
-                "type": "function",
-                "function": {
-                    "name": tool["name"],
-                    "description": tool.get("description", ""),
-                    "parameters": tool.get("input_schema", {"type": "object", "properties": {}}),
-                },
-            })
-        return formatted
-
-    def prepare_system(self, system: Optional[Union[str, list[dict[str, Any]]]]) -> Optional[str]:
-        """
-        Transform system prompt for Kimi.
-
-        Kimi supports system messages similar to OpenAI.
-        """
-        if system is None:
-            return None
-
-        if isinstance(system, str):
-            return system
-
-        # Convert list of blocks to string
-        parts = []
-        for block in system:
-            if isinstance(block, dict) and block.get("type") == "text":
-                parts.append(block.get("text", ""))
-            elif isinstance(block, str):
-                parts.append(block)
-
-        return "\n\n".join(parts)
+        return super().prepare_messages(messages)
 
     def parse_response(self, response: dict[str, Any]) -> dict[str, Any]:
         """
@@ -181,10 +119,3 @@ class KimiHandler(ModelHandler):
         clean_text = "".join(clean_parts).strip()
         return clean_text, tool_uses
 
-    def supports_streaming(self) -> bool:
-        """Check if Kimi supports streaming."""
-        return self.capability.supports_streaming if self.capability else True
-
-    def supports_tools(self) -> bool:
-        """Check if Kimi supports tools."""
-        return self.capability.supports_tools if self.capability else True
