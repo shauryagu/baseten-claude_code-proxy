@@ -2,18 +2,19 @@
 
 A production-ready, model-agnostic proxy that translates Anthropic's Messages API to OpenAI-compatible requests. This enables Claude tooling (like Claude Code) to use alternative backends such as Kimi K2.5 via Baseten, OpenAI GPT models, and other OpenAI-compatible providers.
 
-## 🎯 Purpose
+## Purpose
 
 This proxy solves a specific problem: **Claude's official API only works with Anthropic's models**. If you want to use Claude Code or other Claude tooling with alternative LLM providers (like Kimi, GPT-4o, or any OpenAI-compatible API), you need a translation layer.
 
 This proxy provides that translation layer by:
+
 - Accepting Anthropic's Messages API format
 - Converting requests to OpenAI-compatible format
 - Routing to your chosen backend provider
 - Translating responses back to Anthropic format
 - Supporting streaming, tool calls, and other advanced features
 
-## ✨ Key Features
+## Key Features
 
 - **Model-Agnostic Architecture**: Support multiple backends through a unified handler system
 - **Streaming & Non-Streaming**: Full support for both request types
@@ -25,7 +26,7 @@ This proxy provides that translation layer by:
 - **Security**: Input validation, content sanitization, and request size limits
 - **Production-Ready**: Type hints, error handling, tests, and Docker deployment
 
-## 🏗️ Architecture
+## Architecture
 
 The proxy uses a modular architecture with clear separation of concerns:
 
@@ -45,22 +46,24 @@ Anthropic Request
 
 ### Key Modules
 
-| Module | Responsibility |
-|--------|--------------|
-| `config.py` | Pydantic-based configuration with env var overrides |
-| `models.yaml` | Model capability definitions |
-| `errors.py` | Exception hierarchy with structured error responses |
-| `retry.py` | Exponential backoff, circuit breaker pattern |
-| `security.py` | Input validation with Pydantic models |
-| `rate_limit.py` | Token bucket algorithm, per-key/model limits |
-| `logging_config.py` | Structured JSON/text logging |
-| `middleware.py` | Request logging, metrics, timing, tracing |
-| `performance.py` | Connection pooling, caching |
-| `lifecycle.py` | Start/stop/restart with graceful shutdown |
-| `health.py` | Multi-layer health checking |
-| `main.py` | FastAPI application entry point |
 
-## 🚀 Quick Start
+| Module              | Responsibility                                      |
+| ------------------- | --------------------------------------------------- |
+| `config.py`         | Pydantic-based configuration with env var overrides |
+| `models.yaml`       | Model capability definitions                        |
+| `errors.py`         | Exception hierarchy with structured error responses |
+| `retry.py`          | Exponential backoff, circuit breaker pattern        |
+| `security.py`       | Input validation with Pydantic models               |
+| `rate_limit.py`     | Token bucket algorithm, per-key/model limits        |
+| `logging_config.py` | Structured JSON/text logging                        |
+| `middleware.py`     | Request logging, metrics, timing, tracing           |
+| `performance.py`    | Connection pooling, caching                         |
+| `lifecycle.py`      | Start/stop/restart with graceful shutdown           |
+| `health.py`         | Multi-layer health checking                         |
+| `main.py`           | FastAPI application entry point                     |
+
+
+## Quick Start
 
 ### 1. Configure the Proxy
 
@@ -110,6 +113,7 @@ docker-compose up -d
 ```
 
 Verify it's running:
+
 ```bash
 curl -s http://localhost:8000/health
 # Expected: {"status": "healthy", "checks": {...}, "latency_ms": ...}
@@ -138,11 +142,12 @@ claude
 ```
 
 If you see a login screen on first run:
+
 1. Choose **Anthropic Console (option 2)** and complete OAuth
 2. Type `/logout` in Claude Code
 3. Restart `claude` - it will now use `apiKeyHelper` only
 
-## 📚 Usage Examples
+## Usage Examples
 
 ### Basic Request
 
@@ -210,38 +215,44 @@ curl -X POST http://localhost:8000/v1/messages \
 
 ### Environment Variables
 
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `BASETEN_API_KEY` | Baseten API key for Kimi models | Required |
-| `OPENAI_API_KEY` | OpenAI API key for GPT models | Optional |
-| `PROXY_AUTH_KEY` | Auth key for proxy access | Optional |
-| `DEFAULT_MODEL` | Default model to use | `kimi-k2.5` |
-| `OPENAI_BASE_URL` | OpenAI-compatible API base URL | `https://inference.baseten.co/v1` |
-| `LOG_LEVEL` | Logging level | `INFO` |
-| `LOG_FORMAT` | Log format (`json` or `text`) | `json` |
+
+| Variable          | Description                     | Default                           |
+| ----------------- | ------------------------------- | --------------------------------- |
+| `BASETEN_API_KEY` | Baseten API key for Kimi models | Required                          |
+| `OPENAI_API_KEY`  | OpenAI API key for GPT models   | Optional                          |
+| `PROXY_AUTH_KEY`  | Auth key for proxy access       | Optional                          |
+| `DEFAULT_MODEL`   | Default model to use            | `kimi-k2.5`                       |
+| `OPENAI_BASE_URL` | OpenAI-compatible API base URL  | `https://inference.baseten.co/v1` |
+| `LOG_LEVEL`       | Logging level                   | `INFO`                            |
+| `LOG_FORMAT`      | Log format (`json` or `text`)   | `json`                            |
+
 
 ### Model Configuration
 
 Models are configured in `models.yaml`. Each model defines:
+
 - `capabilities`: What the model supports (streaming, tools, vision, etc.)
 - `handler`: Which handler to use for translation
 - `adapter`: Which tool adapter to use
 
 To add a new model:
+
 1. Add it to `models.yaml`
 2. Reuse an existing handler if possible
 3. Otherwise implement a new `ModelHandler`
 4. Register it in `models/registry.py`
 
-## 📊 API Endpoints
+## API Endpoints
 
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/health` | GET | Basic health check |
-| `/health/detailed` | GET | Detailed health with upstream validation |
-| `/v1/messages` | POST | Anthropic-compatible messages endpoint |
 
-## 🧪 Testing
+| Endpoint           | Method | Description                              |
+| ------------------ | ------ | ---------------------------------------- |
+| `/health`          | GET    | Basic health check                       |
+| `/health/detailed` | GET    | Detailed health with upstream validation |
+| `/v1/messages`     | POST   | Anthropic-compatible messages endpoint   |
+
+
+## Testing
 
 ```bash
 # Run unit tests
@@ -258,34 +269,40 @@ pytest tests/unit/test_config.py -v
 pytest tests/unit/test_tools.py -v
 ```
 
-## 🔍 Troubleshooting
+## Troubleshooting
 
 ### "Auth conflict" warning
+
 Run `/logout` in Claude Code and restart.
 
 ### "Model is Sonnet 4.6" in UI
+
 This is just Claude Code's UI label. The proxy routes to the configured model - verify with the `/health` endpoint.
 
 ### No streaming response
+
 Check that the proxy is running and `ANTHROPIC_BASE_URL` is set correctly in settings.json.
 
 ### Import errors
+
 Ensure you're using Python 3.9+ and all dependencies are installed.
 
 ### Upstream errors
+
 Check the proxy logs for detailed error information. Enable debug logging:
+
 ```bash
 LOG_LEVEL=DEBUG uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 
-## ⚠️ Limitations
+## Limitations
 
 - **Extended thinking**: Not supported by Kimi K2.5
 - **Prompt caching**: Baseten may not support Anthropic's caching headers
 - **Vision/multimodal**: Image inputs are not translated
 - **Tool use**: The proxy handles Claude Code's built-in tools, but LLM-initiated function calling has limited support
 
-## 🏗️ Development
+## Development
 
 ### Code Quality
 
@@ -315,20 +332,12 @@ mypy .
 4. Validate Anthropic-compatible request and response behavior
 5. Add tests for streaming and non-streaming cases
 
-## 📖 Documentation
+## Documentation
 
 - `CLAUDE.md` - Development guidelines and architecture rules
 - `OPTIMIZATIONS.md` - Functional programming optimizations
 - `IMPLEMENTATION_PLAN.md` - Implementation status and roadmap
 
-## 🤝 Contributing
-
-Contributions are welcome! Please read `CLAUDE.md` for development guidelines before contributing.
-
-## 📄 License
-
-MIT License - See LICENSE file for details.
-
-## 🙏 Acknowledgments
+## Acknowledgments
 
 Built to enable flexible use of Claude tooling with alternative LLM providers. Inspired by the need for model-agnostic AI infrastructure.
