@@ -610,6 +610,23 @@ async def detailed_health_check() -> dict[str, Any]:
     return status.to_dict()
 
 
+@app.get("/health/connections")
+async def connection_health() -> dict[str, Any]:
+    """Simple connection pool health check."""
+    try:
+        client = ConnectionPool.get_client()
+        return {
+            "status": "healthy",
+            "http2_enabled": True,
+            "pool_active": True,
+        }
+    except Exception as e:
+        return {
+            "status": "unhealthy",
+            "error": str(e),
+        }, 500
+
+
 @app.post("/v1/messages", response_model=None)
 async def messages(
     request: Request,
@@ -649,28 +666,29 @@ async def messages(
         # Validate request structure
         validated_request = MessageRequest(**body)
 
-        # Check rate limits
-        rate_limiter = get_rate_limiter()
-        api_key = x_api_key or authorization or "anonymous"
-        allowed, headers = rate_limiter.check_rate_limit(
-            api_key, validated_request.model
-        )
+        # Check rate limits (only if enabled - Baseten handles this by default)
+        if CONFIG.rate_limit_enabled:
+            rate_limiter = get_rate_limiter()
+            api_key = x_api_key or authorization or "anonymous"
+            allowed, headers = rate_limiter.check_rate_limit(
+                api_key, validated_request.model
+            )
 
-        if not allowed:
-            logger.warning(
-                "proxy_rate_limit_rejected",
-                source="proxy_local",
-                api_key_prefix=api_key[:8] if len(api_key) > 8 else api_key,
-                model=validated_request.model,
-                retry_after=headers.get("Retry-After"),
-            )
-            raise RateLimitError(
-                "Rate limit exceeded",
-                retry_after=int(headers.get("Retry-After", 60)),
-                limit=int(headers["X-RateLimit-Limit"]) if headers.get("X-RateLimit-Limit") else None,
-                remaining=0,
-                details={"source": "proxy_local"},
-            )
+            if not allowed:
+                logger.warning(
+                    "proxy_rate_limit_rejected",
+                    source="proxy_local",
+                    api_key_prefix=api_key[:8] if len(api_key) > 8 else api_key,
+                    model=validated_request.model,
+                    retry_after=headers.get("Retry-After"),
+                )
+                raise RateLimitError(
+                    "Rate limit exceeded",
+                    retry_after=int(headers.get("Retry-After", 60)),
+                    limit=int(headers["X-RateLimit-Limit"]) if headers.get("X-RateLimit-Limit") else None,
+                    remaining=0,
+                    details={"source": "proxy_local"},
+                )
 
         # Get model handler
         model_id, handler = get_model_for_request(validated_request.model)
@@ -727,9 +745,6 @@ async def messages(
         if validated_request.stream:
             payload["stream_options"] = {"include_usage": True, "continuous_usage_stats": True}
 
-        # Get circuit breaker
-        circuit_breaker = get_circuit_breaker()
-
         # Make upstream request
         url = f"{CONFIG.baseten_base_url}/chat/completions"
         # Use a separate variable to avoid shadowing the route's `headers` parameter
@@ -746,40 +761,79 @@ async def messages(
             else:
                 return await client.post(url, headers=upstream_headers, json=payload)
 
-        try:
-            response = await circuit_breaker.call(make_request)
-        except httpx.HTTPStatusError as e:
-            # Upstream returned an explicit HTTP error code.
-            # Preserve 429s as RateLimitError so Claude can honour Retry-After
-            # and so logs clearly distinguish proxy-local vs upstream throttling.
-            upstream_status = e.response.status_code
-            if upstream_status == 429:
-                retry_after_raw = e.response.headers.get("Retry-After", "60")
-                try:
-                    retry_after = int(retry_after_raw)
-                except ValueError:
-                    retry_after = 60
-                logger.warning(
-                    "upstream_rate_limit",
-                    source="upstream",
+        # Use circuit breaker only if enabled (Baseten handles this by default)
+        if CONFIG.circuit_breaker_enabled:
+            circuit_breaker = get_circuit_breaker()
+            try:
+                response = await circuit_breaker.call(make_request)
+            except httpx.HTTPStatusError as e:
+                # Upstream returned an explicit HTTP error code.
+                # Preserve 429s as RateLimitError so Claude can honour Retry-After
+                # and so logs clearly distinguish proxy-local vs upstream throttling.
+                upstream_status = e.response.status_code
+                if upstream_status == 429:
+                    retry_after_raw = e.response.headers.get("Retry-After", "60")
+                    try:
+                        retry_after = int(retry_after_raw)
+                    except ValueError:
+                        retry_after = 60
+                    logger.warning(
+                        "upstream_rate_limit",
+                        source="upstream",
+                        provider="baseten",
+                        retry_after=retry_after,
+                    )
+                    raise RateLimitError(
+                        "Upstream rate limit exceeded",
+                        retry_after=retry_after,
+                        details={"source": "upstream", "provider": "baseten"},
+                    ) from e
+                raise UpstreamError(
+                    f"Upstream returned HTTP {upstream_status}",
+                    upstream_status=upstream_status,
                     provider="baseten",
-                    retry_after=retry_after,
-                )
-                raise RateLimitError(
-                    "Upstream rate limit exceeded",
-                    retry_after=retry_after,
-                    details={"source": "upstream", "provider": "baseten"},
                 ) from e
-            raise UpstreamError(
-                f"Upstream returned HTTP {upstream_status}",
-                upstream_status=upstream_status,
-                provider="baseten",
-            ) from e
-        except Exception as e:
-            raise UpstreamError(
-                f"Upstream request failed: {e}",
-                provider="baseten",
-            ) from e
+            except Exception as e:
+                raise UpstreamError(
+                    f"Upstream request failed: {e}",
+                    provider="baseten",
+                ) from e
+        else:
+            # Direct call without circuit breaker
+            try:
+                response = await make_request()
+            except httpx.HTTPStatusError as e:
+                # Upstream returned an explicit HTTP error code.
+                # Preserve 429s as RateLimitError so Claude can honour Retry-After
+                # and so logs clearly distinguish proxy-local vs upstream throttling.
+                upstream_status = e.response.status_code
+                if upstream_status == 429:
+                    retry_after_raw = e.response.headers.get("Retry-After", "60")
+                    try:
+                        retry_after = int(retry_after_raw)
+                    except ValueError:
+                        retry_after = 60
+                    logger.warning(
+                        "upstream_rate_limit",
+                        source="upstream",
+                        provider="baseten",
+                        retry_after=retry_after,
+                    )
+                    raise RateLimitError(
+                        "Upstream rate limit exceeded",
+                        retry_after=retry_after,
+                        details={"source": "upstream", "provider": "baseten"},
+                    ) from e
+                raise UpstreamError(
+                    f"Upstream returned HTTP {upstream_status}",
+                    upstream_status=upstream_status,
+                    provider="baseten",
+                ) from e
+            except Exception as e:
+                raise UpstreamError(
+                    f"Upstream request failed: {e}",
+                    provider="baseten",
+                ) from e
 
         if validated_request.stream:
             # Return streaming response.

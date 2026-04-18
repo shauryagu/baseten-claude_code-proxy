@@ -87,14 +87,17 @@ class ProxyConfig(BaseSettings):
     max_retries: int = Field(default=3, alias="MAX_RETRIES")
     retry_delay: float = Field(default=1.0, alias="RETRY_DELAY")
     request_timeout: float = Field(default=300.0, alias="REQUEST_TIMEOUT")
-    max_connections: int = Field(default=100, alias="MAX_CONNECTIONS")
-    keepalive_connections: int = Field(default=20, alias="KEEPALIVE_CONNECTIONS")
+    max_connections: int = Field(default=200, alias="MAX_CONNECTIONS")
+    keepalive_connections: int = Field(default=100, alias="KEEPALIVE_CONNECTIONS")
 
     # Rate limiting
     rate_limit_enabled: bool = Field(default=True, alias="RATE_LIMIT_ENABLED")
     rate_limit_requests: int = Field(default=100, alias="RATE_LIMIT_REQUESTS")
     rate_limit_window: int = Field(default=60, alias="RATE_LIMIT_WINDOW")
     rate_limit_by_key: bool = Field(default=True, alias="RATE_LIMIT_BY_KEY")
+
+    # Circuit breaker (can be disabled since Baseten handles this)
+    circuit_breaker_enabled: bool = Field(default=False, alias="CIRCUIT_BREAKER_ENABLED")
 
     # Logging
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")

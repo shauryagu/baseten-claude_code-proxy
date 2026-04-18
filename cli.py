@@ -62,8 +62,8 @@ Examples:
     start_parser.add_argument(
         "--workers",
         type=int,
-        default=1,
-        help="Number of worker processes (default: 1)",
+        default=4,
+        help="Number of worker processes (default: 4)",
     )
     start_parser.add_argument(
         "--daemon",
@@ -187,7 +187,7 @@ def show_status() -> int:
 async def check_health(verbose: bool = False) -> int:
     """Check proxy health."""
     checker = get_health_checker()
-    health = await check(include_upstream=True)
+    health = await checker.check(include_upstream=True)
 
     if verbose:
         print(json.dumps(health.to_dict(), indent=2))

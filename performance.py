@@ -39,6 +39,8 @@ class ConnectionPool:
                     max_connections=CONFIG.max_connections,
                 ),
                 http2=True,
+                verify=True,
+                follow_redirects=True,
             )
             logger.info(
                 "http_client_initialized",

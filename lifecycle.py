@@ -65,7 +65,7 @@ class ProxyManager:
         self,
         host: str = "0.0.0.0",
         port: int = 8000,
-        workers: int = 1,
+        workers: int = 4,
         daemon: bool = False,
         reload: bool = False,
     ) -> None:
@@ -105,8 +105,8 @@ class ProxyManager:
         # Setup signal handlers
         self._setup_signal_handlers()
 
-        # Import app here to avoid circular imports
-        from app import app
+        # Import the modular app (app.py is frozen legacy code)
+        from main import app
 
         # Configure uvicorn
         config = uvicorn.Config(
