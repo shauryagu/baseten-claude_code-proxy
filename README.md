@@ -45,8 +45,67 @@ CIRCUIT_BREAKER_ENABLED=false
 
 ### 2. Start
 
+You can run the proxy directly with Python or in a container with Docker/Podman.
+
+#### Option A: Python (local)
+
 ```bash
 python -m cli start --workers 4
+```
+
+#### Option B: Docker
+
+```bash
+# Build the image once
+docker build -t anthropic-proxy .
+
+# Run it (loads variables from .env and exposes port 8000)
+docker run -d \
+  --name anthropic-proxy \
+  --restart unless-stopped \
+  -p 8000:8000 \
+  --env-file .env \
+  anthropic-proxy
+```
+
+Or with Compose for the full stack:
+
+```bash
+docker compose up -d              # proxy only
+docker compose --profile with-redis up -d     # with Redis
+docker compose --profile with-metrics up -d   # with Prometheus + Grafana
+```
+
+#### Option C: Podman
+
+Podman is CLI-compatible with Docker, so the same commands work with `podman` substituted in:
+
+```bash
+# Build
+podman build -t anthropic-proxy .
+
+# Run (rootless by default; --userns=keep-id keeps file ownership sane on bind mounts)
+podman run -d \
+  --name anthropic-proxy \
+  --restart unless-stopped \
+  -p 8000:8000 \
+  --env-file .env \
+  anthropic-proxy
+```
+
+For Compose with Podman, either use `podman compose ...` (Podman 4+) or install `podman-compose` and run `podman-compose up -d`.
+
+To make the container start automatically on login (macOS / Linux with systemd-user), generate a Podman service unit:
+
+```bash
+# Linux (systemd user services)
+podman generate systemd --new --name anthropic-proxy \
+  > ~/.config/systemd/user/anthropic-proxy.service
+systemctl --user daemon-reload
+systemctl --user enable --now anthropic-proxy.service
+
+# macOS: use 'podman machine start' on boot, then rely on --restart unless-stopped
+podman machine set --rootful=false
 ```
 
 ### 3. Configure Claude Code
@@ -183,6 +242,79 @@ for i in {1..20}; do
 done
 wait
 ```
+
+## Run From Any Directory (Persistent Alias)
+
+Once the image is built and a `.env` exists in the repo, you can wrap the container lifecycle in shell aliases / functions so you can start it from anywhere.
+
+### Recommended: shell functions in `~/.zshrc`
+
+Functions are preferable to aliases here because they can resolve absolute paths reliably.
+
+```bash
+# ~/.zshrc  (or ~/.bashrc)
+# Anthropic proxy container helpers — works from any directory
+
+# Absolute path to this repo (edit if you move it)
+export ANTHROPIC_PROXY_DIR="$HOME/PersonalProjects/AiExplore/anthropic-proxy"
+
+# Container runtime: switch to "docker" if you prefer Docker
+export ANTHROPIC_PROXY_RUNTIME="podman"
+
+proxy-build() {
+  $ANTHROPIC_PROXY_RUNTIME build -t anthropic-proxy "$ANTHROPIC_PROXY_DIR"
+}
+
+proxy-start() {
+  $ANTHROPIC_PROXY_RUNTIME run -d \
+    --name anthropic-proxy \
+    --restart unless-stopped \
+    -p 8000:8000 \
+    --env-file "$ANTHROPIC_PROXY_DIR/.env" \
+    anthropic-proxy
+}
+
+proxy-stop() {
+  $ANTHROPIC_PROXY_RUNTIME stop anthropic-proxy 2>/dev/null
+  $ANTHROPIC_PROXY_RUNTIME rm   anthropic-proxy 2>/dev/null
+}
+
+proxy-restart() { proxy-stop; proxy-start; }
+proxy-logs()    { $ANTHROPIC_PROXY_RUNTIME logs -f anthropic-proxy; }
+proxy-status()  { $ANTHROPIC_PROXY_RUNTIME ps --filter name=anthropic-proxy; }
+```
+
+Reload your shell once:
+
+```bash
+source ~/.zshrc
+```
+
+Then from anywhere on your system you can run:
+
+```bash
+proxy-start     # launch the container
+proxy-logs      # tail logs
+proxy-restart   # stop + start
+proxy-stop      # stop and remove
+```
+
+### Alternative: pure aliases
+
+If you prefer one-liners, put these in `~/.zshrc`:
+
+```bash
+alias proxy-build='podman build -t anthropic-proxy "$HOME/PersonalProjects/AiExplore/anthropic-proxy"'
+alias proxy-start='podman run -d --name anthropic-proxy --restart unless-stopped -p 8000:8000 --env-file "$HOME/PersonalProjects/AiExplore/anthropic-proxy/.env" anthropic-proxy'
+alias proxy-stop='podman stop anthropic-proxy && podman rm anthropic-proxy'
+alias proxy-logs='podman logs -f anthropic-proxy'
+```
+
+### Auto-start on boot/login
+
+- **Linux (systemd user)**: see the `podman generate systemd` snippet in the Quick Start. Enabling that unit makes the container start on every login automatically.
+- **macOS with Podman**: ensure the Podman VM starts on login with `podman machine start` (you can add this to a LaunchAgent or to your `~/.zshrc`), then `--restart unless-stopped` will bring the container back up.
+- **Docker Desktop**: enable "Start Docker Desktop when you log in" in settings; `--restart unless-stopped` then handles the container itself.
 
 ## Troubleshooting
 
